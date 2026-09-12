@@ -1,0 +1,334 @@
+# -----------------------------------------------------------------------------
+# PROJET
+# -----------------------------------------------------------------------------
+
+project:
+  name: "TP_IaC_Reseaux_M1"
+
+
+# -----------------------------------------------------------------------------
+# SERVEUR GNS3
+# -----------------------------------------------------------------------------
+
+gns3_server:
+  host: "127.0.0.1"
+  port: 3080
+  protocol: "http"
+  user: null
+  password: null
+  compute_id: "local"
+
+
+# -----------------------------------------------------------------------------
+# TEMPLATES
+# -----------------------------------------------------------------------------
+
+templates:
+  router: "c7200"
+  switch: "Ethernet switch"
+  pc: "VPCS"
+
+
+# -----------------------------------------------------------------------------
+# NODES
+# -----------------------------------------------------------------------------
+
+nodes:
+
+  # ==================================================
+  # ROUTEUR R1
+  # ==================================================
+
+  - name: R1
+    template: router
+    x: -250
+    y: -150
+
+    console_bootstrap:
+      hostname: R1
+      username: mouha
+      password: mouha
+      enable_secret: cmouha
+
+    interfaces:
+
+      - name: GigabitEthernet0/0
+        adapter: 0
+        port: 0
+        ip: 192.168.1.1
+        mask: 255.255.255.0
+        description: "LAN vers SW1 / PC1"
+
+      - name: GigabitEthernet1/0
+        adapter: 1
+        port: 0
+        ip: 10.0.0.1
+        mask: 255.255.255.252
+        description: "Lien point-a-point vers R2"
+
+      - name: GigabitEthernet2/0
+        adapter: 2
+        port: 0
+        ip: 192.168.100.11
+        mask: 255.255.255.0
+        description: "Reseau de management"
+
+    static_routes:
+
+      - network: 192.168.2.0
+        mask: 255.255.255.0
+        next_hop: 10.0.0.2
+
+
+  # ==================================================
+  # ROUTEUR R2
+  # ==================================================
+
+  - name: R2
+    template: router
+    x: 250
+    y: -150
+
+    console_bootstrap:
+      hostname: R2
+      username: mouha
+      password: mouha
+      enable_secret: mouha
+
+    interfaces:
+
+      - name: GigabitEthernet0/0
+        adapter: 0
+        port: 0
+        ip: 192.168.2.1
+        mask: 255.255.255.0
+        description: "LAN vers SW2 / PC2"
+
+      - name: GigabitEthernet1/0
+        adapter: 1
+        port: 0
+        ip: 10.0.0.2
+        mask: 255.255.255.252
+        description: "Lien point-a-point vers R1"
+
+      - name: GigabitEthernet2/0
+        adapter: 2
+        port: 0
+        ip: 192.168.100.12
+        mask: 255.255.255.0
+        description: "Reseau de management"
+
+    static_routes:
+
+      - network: 192.168.1.0
+        mask: 255.255.255.0
+        next_hop: 10.0.0.1
+
+
+  # ==================================================
+  # SWITCH LAN 1
+  # ==================================================
+
+  - name: SW1
+    template: switch
+    x: -450
+    y: -150
+
+
+  # ==================================================
+  # SWITCH LAN 2
+  # ==================================================
+
+  - name: SW2
+    template: switch
+    x: 450
+    y: -150
+
+
+  # ==================================================
+  # SWITCH MANAGEMENT
+  # ==================================================
+
+  - name: SWMGT
+    template: switch
+    x: 0
+    y: 50
+
+
+  # ==================================================
+  # CLOUD GNS3
+  # ==================================================
+
+  - name: CLOUD1
+    template: cloud
+    x: 0
+    y: 250
+
+    compute_id: "vm"
+    cloud_interface: "eth1"
+
+
+  # ==================================================
+  # PC1
+  # ==================================================
+
+  - name: PC1
+    template: pc
+    x: -650
+    y: -150
+
+    vpcs_config:
+      ip: 192.168.1.10
+      mask: 255.255.255.0
+      gateway: 192.168.1.1
+
+
+  # ==================================================
+  # PC2
+  # ==================================================
+
+  - name: PC2
+    template: pc
+    x: 650
+    y: -150
+
+    vpcs_config:
+      ip: 192.168.2.10
+      mask: 255.255.255.0
+      gateway: 192.168.2.1
+
+
+# -----------------------------------------------------------------------------
+# LIENS
+# -----------------------------------------------------------------------------
+
+links:
+
+  - endpoints:
+
+      - node: PC1
+        adapter: 0
+        port: 0
+
+      - node: SW1
+        adapter: 0
+        port: 0
+
+
+  - endpoints:
+
+      - node: SW1
+        adapter: 0
+        port: 1
+
+      - node: R1
+        adapter: 0
+        port: 0
+
+
+  - endpoints:
+
+      - node: R1
+        adapter: 1
+        port: 0
+
+      - node: R2
+        adapter: 1
+        port: 0
+
+
+  - endpoints:
+
+      - node: R2
+        adapter: 0
+        port: 0
+
+      - node: SW2
+        adapter: 0
+        port: 0
+
+
+  - endpoints:
+
+      - node: SW2
+        adapter: 0
+        port: 1
+
+      - node: PC2
+        adapter: 0
+        port: 0
+
+
+  # R1 -> MANAGEMENT
+
+  - endpoints:
+
+      - node: R1
+        adapter: 2
+        port: 0
+
+      - node: SWMGT
+        adapter: 0
+        port: 0
+
+
+  # R2 -> MANAGEMENT
+
+  - endpoints:
+
+      - node: R2
+        adapter: 2
+        port: 0
+
+      - node: SWMGT
+        adapter: 0
+        port: 1
+
+
+  # SWMGT -> CLOUD
+
+  - endpoints:
+
+      - node: SWMGT
+        adapter: 0
+        port: 2
+
+      - node: CLOUD1
+        adapter: 0
+        port: 1
+
+
+# -----------------------------------------------------------------------------
+# TESTS
+# -----------------------------------------------------------------------------
+
+tests:
+
+  ping:
+
+    - from: R1
+      target: 10.0.0.2
+      description: "R1 vers R2"
+
+    - from: R1
+      target: 192.168.2.1
+      description: "R1 vers LAN R2"
+
+    - from: R2
+      target: 192.168.1.1
+      description: "R2 vers LAN R1"
+
+    - from: PC1
+      target: 192.168.2.10
+      description: "PC1 vers PC2"
+
+    - from: PC2
+      target: 192.168.1.10
+      description: "PC2 vers PC1"
+
+
+  show_commands:
+
+    - "show ip interface brief"
+    - "show ip route"
+    - "show version | include Version"
