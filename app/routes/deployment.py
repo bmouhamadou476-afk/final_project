@@ -1,1363 +1,978 @@
+# =============================================================================
+# ÉTAPE 1 - IMPORTS
+# =============================================================================
+
 import time
 
-from fastapi import (
-    APIRouter,
-    HTTPException
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+
+from app.databases import get_db
+
+from app.models.topology import Topologie
+from app.models.equipements import Equipement
+from app.models.interfaces import Interface
+from app.models.connexions import Connexion
+
+from app.services.gns3_service import GNS3Service
+from app.services.netmiko_service import NetmikoService
+
+
+# =============================================================================
+# ÉTAPE 2 - ROUTER FASTAPI
+# =============================================================================
+
+router = APIRouter(
+    prefix="/api/topologies",
+    tags=["Deployment"],
 )
 
-from app.services.gns3_service import (
-    GNS3Service
-)
 
-from app.services.yaml_service import (
-    load_topology_yaml
-)
+# =============================================================================
+# ÉTAPE 3 - CONSTRUCTION DE LA CONFIGURATION INTERFACE
+# =============================================================================
 
-from app.services.netmiko_service import (
-    NetmikoService
-)
-
-
-# ==========================================================
-# GENERATION DE LA CONFIGURATION DES ROUTEURS
-# ==========================================================
-
-def build_router_configuration(node):
+def build_interface_commands(interfaces):
+    """
+    Construit automatiquement les commandes Cisco
+    à partir des interfaces enregistrées dans MySQL.
+    """
 
     commands = []
 
-    bootstrap = node.console_bootstrap
+    for interface in interfaces:
 
+        # Une interface sans adresse IP ne nécessite
+        # pas de configuration IP.
+        if not interface.adresse_ip:
+            continue
 
-    # ======================================================
-    # CONFIGURATION GENERALE
-    # ======================================================
-
-    if bootstrap:
-
-        commands.extend(
-
-            [
-
-                f"hostname {bootstrap.hostname}",
-
-                f"enable secret {bootstrap.enable_secret}",
-
-                f"username {bootstrap.username} "
-                f"privilege 15 secret {bootstrap.password}",
-
-                "ip domain-name gns3.local",
-
-            ]
-
-        )
-
-
-    # ======================================================
-    # CONFIGURATION DES INTERFACES
-    # ======================================================
-
-    for interface in node.interfaces:
-
-        interface_commands = [
-
-            f"interface {interface.name}",
-
-        ]
-
-
-        if interface.description:
-
-            interface_commands.append(
-
-                f"description {interface.description}"
-
-            )
-
-
-        if interface.ip and interface.mask:
-
-            interface_commands.append(
-
-                f"ip address "
-                f"{interface.ip} "
-                f"{interface.mask}"
-
-            )
-
-
-        interface_commands.extend(
-
-            [
-
-                "no shutdown",
-
-                "exit"
-
-            ]
-
-        )
-
-
-        commands.extend(
-            interface_commands
-        )
-
-
-    # ======================================================
-    # CONFIGURATION SSH
-    # ======================================================
-
-    if bootstrap:
-
-        commands.extend(
-
-            [
-
-                "crypto key generate rsa modulus 1024",
-
-                "ip ssh version 2",
-
-                "line vty 0 4",
-
-                "login local",
-
-                "transport input ssh",
-
-                "exit",
-
-            ]
-
-        )
-
-
-    # ======================================================
-    # ROUTES STATIQUES
-    # ======================================================
-
-    for route in node.static_routes:
+        if not interface.masque:
+            continue
 
         commands.append(
-
-            f"ip route "
-            f"{route.network} "
-            f"{route.mask} "
-            f"{route.next_hop}"
-
+            f"interface {interface.nom}"
         )
 
+        commands.append(
+            f"ip address {interface.adresse_ip} "
+            f"{interface.masque}"
+        )
+
+        commands.append(
+            "no shutdown"
+        )
+
+        if interface.description:
+            commands.append(
+                f"description {interface.description}"
+            )
+
+        commands.append("exit")
 
     return commands
 
 
-# ==========================================================
-# ROUTER FASTAPI
-# ==========================================================
+# =============================================================================
+# ÉTAPE 4 - CONSTRUCTION DE LA CONFIGURATION SSH
+# =============================================================================
 
-router = APIRouter(
+def build_ssh_commands(equipement):
+    """
+    Construit automatiquement la configuration SSH
+    à partir des informations de l'équipement.
+    """
 
-    prefix="/api/topologies",
+    commands = []
 
-    tags=[
-        "Deployment"
-    ]
+    if equipement.username and equipement.password:
 
-)
+        commands.append(
+            f"username {equipement.username} "
+            f"privilege 15 "
+            f"secret {equipement.password}"
+        )
+
+    # Nécessaire pour la génération des clés RSA
+    commands.append(
+        "ip domain-name lab.local"
+    )
+
+    commands.append(
+        "ip ssh version 2"
+    )
+
+    # Configuration des lignes VTY
+    commands.append(
+        "line vty 0 4"
+    )
+
+    commands.append(
+        "login local"
+    )
+
+    commands.append(
+        "transport input ssh"
+    )
+
+    commands.append(
+        "exit"
+    )
+
+    return commands
 
 
-# ==========================================================
-# DEPLOIEMENT YAML
-# ==========================================================
+# =============================================================================
+# ÉTAPE 5 - DEPLOIEMENT COMPLET
+# =============================================================================
 
-@router.post(
-    "/deploy-yaml"
-)
-def deploy_topology_from_yaml():
+@router.post("/{topologie_id}/deploy")
+def deploy_topologie(
+    topologie_id: int,
+    db: Session = Depends(get_db),
+):
+
+    # -------------------------------------------------------------------------
+    # 5.1 - Récupération de la topologie
+    # -------------------------------------------------------------------------
+
+    topologie = (
+        db.query(Topologie)
+        .filter(
+            Topologie.id == topologie_id
+        )
+        .first()
+    )
+
+    if not topologie:
+        raise HTTPException(
+            status_code=404,
+            detail="Topologie introuvable"
+        )
+
+    # -------------------------------------------------------------------------
+    # 5.2 - Récupération des équipements
+    # -------------------------------------------------------------------------
+
+    equipements = (
+        db.query(Equipement)
+        .filter(
+            Equipement.topologie_id == topologie_id
+        )
+        .all()
+    )
+
+    if not equipements:
+        raise HTTPException(
+            status_code=400,
+            detail="La topologie ne contient aucun équipement"
+        )
+
+    # -------------------------------------------------------------------------
+    # 5.3 - Récupération des connexions
+    # -------------------------------------------------------------------------
+
+    connexions = (
+        db.query(Connexion)
+        .filter(
+            Connexion.topologie_id == topologie_id
+        )
+        .all()
+    )
+
+    # -------------------------------------------------------------------------
+    # 5.4 - Initialisation GNS3
+    # -------------------------------------------------------------------------
+
+    gns3 = GNS3Service()
+
+    result = {
+        "topologie": {
+            "id": topologie.id,
+            "nom": topologie.nom,
+            "statut": None,
+        },
+
+        "gns3": {
+            "project_id": None,
+        },
+
+        "equipements": [],
+
+        "connexions": [],
+
+        "configuration_interfaces": [],
+
+        "configuration_ssh": [],
+
+        "verification_ssh": [],
+
+        "erreurs": [],
+    }
 
     try:
 
+        # =====================================================================
+        # ÉTAPE 6 - CRÉATION / RÉCUPÉRATION DU PROJET GNS3
+        # =====================================================================
 
-        # ==================================================
-        # CHARGEMENT YAML
-        # ==================================================
-
-        topology = (
-            load_topology_yaml()
+        project = gns3.get_or_create_project(
+            topologie.nom
         )
 
+        project_id = project.get(
+            "project_id"
+        )
 
-        # ==================================================
-        # CONNEXION GNS3
-        # ==================================================
-
-        gns3 = (
-
-            GNS3Service(
-
-                host=(
-                    topology
-                    .gns3_server
-                    .host
-                ),
-
-                port=(
-                    topology
-                    .gns3_server
-                    .port
-                ),
-
-                protocol=(
-                    topology
-                    .gns3_server
-                    .protocol
-                ),
-
-                user=(
-                    topology
-                    .gns3_server
-                    .user
-                ),
-
-                password=(
-                    topology
-                    .gns3_server
-                    .password
-                ),
-
-                compute_id=(
-                    topology
-                    .gns3_server
-                    .compute_id
-                )
-
+        if not project_id:
+            raise ValueError(
+                "GNS3 n'a pas retourné de project_id."
             )
 
-        )
+        result["gns3"]["project_id"] = project_id
 
+        topologie.gns3_project_id = project_id
 
-        # ==================================================
-        # VERIFICATION GNS3
-        # ==================================================
+        topologie.statut = "deploying"
 
-        version = (
-            gns3.get_version()
-        )
+        db.commit()
 
-
-        computes = (
-            gns3.get_computes()
-        )
-
-
-        # ==================================================
-        # PROJET
-        # ==================================================
-
-        project = (
-
-            gns3.get_or_create_project(
-
-                topology.project.name
-
-            )
-
-        )
-
-
-        project_id = (
-            project["project_id"]
-        )
-
+        # =====================================================================
+        # ÉTAPE 7 - OUVERTURE ET NETTOYAGE DU PROJET GNS3
+        # =====================================================================
 
         gns3.open_project(
             project_id
         )
 
-
-        # ==================================================
-        # NETTOYAGE
-        # ==================================================
-
         gns3.clear_project(
             project_id
         )
 
-        time.sleep(2)
+        # Dictionnaire :
+        #
+        # ID MySQL équipement
+        #        ↓
+        # ID node GNS3
+        #
+        node_map = {}
 
+        # =====================================================================
+        # ÉTAPE 8 - CRÉATION AUTOMATIQUE DES ÉQUIPEMENTS GNS3
+        # =====================================================================
 
-        # ==================================================
-        # RESOLUTION DES TEMPLATES
-        # ==================================================
+        for equipement in equipements:
 
-        resolved_templates = {}
+            if not equipement.template_gns3:
 
-
-        templates_data = (
-
-            topology
-            .templates
-            .model_dump()
-
-        )
-
-
-        for (
-            template_key,
-            template_name
-        ) in templates_data.items():
-
-            template = (
-
-                gns3.find_template(
-                    template_name
+                raise ValueError(
+                    f"L'équipement {equipement.nom} "
+                    "n'a pas de template GNS3."
                 )
 
+            # -----------------------------------------------------------------
+            # Recherche du template
+            # -----------------------------------------------------------------
+
+            template = gns3.find_template(
+                equipement.template_gns3
             )
 
+            template_id = template.get(
+                "template_id"
+            )
 
-            resolved_templates[
-                template_key
-            ] = template
+            if not template_id:
 
-
-        # ==================================================
-        # CREATION DES NODES
-        # ==================================================
-
-        created_nodes = {}
-
-        nodes_created_response = []
-
-
-        for node in topology.nodes:
-
-
-            # ==============================================
-            # CLOUD
-            # ==============================================
-
-            if node.template == "cloud":
-
-                if not node.cloud_interface:
-
-                    raise ValueError(
-
-                        f"Le Cloud "
-                        f"{node.name} "
-                        f"n'a pas de cloud_interface"
-
-                    )
-
-
-                cloud_compute_id = (
-
-                    node.compute_id
-
-                    or
-
-                    topology
-                    .gns3_server
-                    .compute_id
-
+                raise ValueError(
+                    f"Le template "
+                    f"{equipement.template_gns3} "
+                    "ne possède pas de template_id."
                 )
 
+            # -----------------------------------------------------------------
+            # Paramètres GNS3
+            # -----------------------------------------------------------------
 
-                gns3.find_compute(
-                    cloud_compute_id
+            compute_id = (
+                equipement.compute_id
+                or "local"
+            )
+
+            x = (
+                equipement.x
+                if equipement.x is not None
+                else 100
+            )
+
+            y = (
+                equipement.y
+                if equipement.y is not None
+                else 100
+            )
+
+            # -----------------------------------------------------------------
+            # Création du node
+            # -----------------------------------------------------------------
+
+            node = gns3.create_node(
+                project_id=project_id,
+                template_id=template_id,
+                compute_id=compute_id,
+                name=equipement.nom,
+                x=x,
+                y=y,
+            )
+
+            node_id = node.get(
+                "node_id"
+            )
+
+            if not node_id:
+
+                raise ValueError(
+                    f"GNS3 n'a pas retourné de node_id "
+                    f"pour {equipement.nom}."
                 )
 
+            # -----------------------------------------------------------------
+            # Sauvegarde de l'ID GNS3 dans MySQL
+            # -----------------------------------------------------------------
 
-                created_node = (
+            equipement.gns3_node_id = node_id
 
-                    gns3.create_cloud_node(
+            db.commit()
 
-                        project_id=project_id,
+            node_map[equipement.id] = node_id
 
-                        name=node.name,
-
-                        x=node.x,
-
-                        y=node.y,
-
-                        interface_name=(
-                            node.cloud_interface
-                        ),
-
-                        compute_id=(
-                            cloud_compute_id
-                        )
-
-                    )
-
-                )
-
-
-                template_name = "Cloud"
-
-                node_type = "cloud"
-
-                node_compute_id = (
-                    cloud_compute_id
-                )
-
-
-            # ==============================================
-            # AUTRES NODES
-            # ==============================================
-
-            else:
-
-                template_key = (
-                    node.template
-                )
-
-
-                if (
-
-                    template_key
-
-                    not in
-
-                    resolved_templates
-
-                ):
-
-                    raise ValueError(
-
-                        f"Template YAML inconnu : "
-                        f"{template_key}"
-
-                    )
-
-
-                template = (
-
-                    resolved_templates[
-                        template_key
-                    ]
-
-                )
-
-
-                node_compute_id = (
-
-                    node.compute_id
-
-                    or
-
-                    topology
-                    .gns3_server
-                    .compute_id
-
-                )
-
-
-                gns3.find_compute(
-                    node_compute_id
-                )
-
-
-                created_node = (
-
-                    gns3.create_node(
-
-                        project_id=project_id,
-
-                        name=node.name,
-
-                        x=node.x,
-
-                        y=node.y,
-
-                        template_id=(
-                            template[
-                                "template_id"
-                            ]
-                        ),
-
-                        compute_id=(
-                            node_compute_id
-                        )
-
-                    )
-
-                )
-
-
-                template_name = (
-                    template["name"]
-                )
-
-
-                node_type = (
-
-                    created_node.get(
-                        "node_type"
-                    )
-
-                )
-
-
-            # ==============================================
-            # SAUVEGARDE NODE
-            # ==============================================
-
-            created_nodes[
-                node.name
-            ] = created_node
-
-
-            nodes_created_response.append(
-
+            result["equipements"].append(
                 {
-
-                    "name":
-                        node.name,
-
-                    "node_id":
-                        created_node.get(
-                            "node_id"
-                        ),
-
-                    "template":
-                        template_name,
-
-                    "node_type":
-                        node_type,
-
-                    "compute_id":
-                        node_compute_id
-
+                    "id": equipement.id,
+                    "nom": equipement.nom,
+                    "template": equipement.template_gns3,
+                    "compute_id": compute_id,
+                    "gns3_node_id": node_id,
                 }
-
             )
 
+        # =====================================================================
+        # ÉTAPE 9 - CRÉATION AUTOMATIQUE DES CONNEXIONS GNS3
+        # =====================================================================
 
-        # ==================================================
-        # CREATION DES LIENS
-        # ==================================================
+        for connexion in connexions:
 
-        links_created_response = []
+            source_node_id = node_map.get(
+                connexion.equipement_source_id
+            )
 
+            destination_node_id = node_map.get(
+                connexion.equipement_destination_id
+            )
 
-        for link in topology.links:
-
-
-            if len(link.endpoints) != 2:
+            if not source_node_id:
 
                 raise ValueError(
-
-                    "Chaque lien doit avoir "
-                    "exactement 2 endpoints"
-
+                    "Node GNS3 source introuvable "
+                    f"pour l'équipement "
+                    f"{connexion.equipement_source_id}."
                 )
 
-
-            source = (
-                link.endpoints[0]
-            )
-
-            destination = (
-                link.endpoints[1]
-            )
-
-
-            if source.node not in created_nodes:
+            if not destination_node_id:
 
                 raise ValueError(
-
-                    f"Node source introuvable : "
-                    f"{source.node}"
-
+                    "Node GNS3 destination introuvable "
+                    f"pour l'équipement "
+                    f"{connexion.equipement_destination_id}."
                 )
 
+            # -----------------------------------------------------------------
+            # Interface source
+            # -----------------------------------------------------------------
 
-            if destination.node not in created_nodes:
+            interface_source = (
+                db.query(Interface)
+                .filter(
+                    Interface.id
+                    == connexion.interface_source_id
+                )
+                .first()
+            )
+
+            if not interface_source:
 
                 raise ValueError(
-
-                    f"Node destination introuvable : "
-                    f"{destination.node}"
-
+                    "Interface source introuvable "
+                    f"(ID={connexion.interface_source_id})."
                 )
 
+            # -----------------------------------------------------------------
+            # Interface destination
+            # -----------------------------------------------------------------
 
-            source_node = (
-                created_nodes[
-                    source.node
-                ]
+            interface_destination = (
+                db.query(Interface)
+                .filter(
+                    Interface.id
+                    == connexion.interface_destination_id
+                )
+                .first()
             )
 
+            if not interface_destination:
 
-            destination_node = (
-                created_nodes[
-                    destination.node
-                ]
-            )
-
-
-            created_link = (
-
-                gns3.create_link(
-
-                    project_id=project_id,
-
-                    node_source_id=(
-                        source_node[
-                            "node_id"
-                        ]
-                    ),
-
-                    adapter_source=(
-                        source.adapter
-                    ),
-
-                    port_source=(
-                        source.port
-                    ),
-
-                    node_destination_id=(
-                        destination_node[
-                            "node_id"
-                        ]
-                    ),
-
-                    adapter_destination=(
-                        destination.adapter
-                    ),
-
-                    port_destination=(
-                        destination.port
-                    )
-
+                raise ValueError(
+                    "Interface destination introuvable "
+                    f"(ID={connexion.interface_destination_id})."
                 )
 
+            # -----------------------------------------------------------------
+            # Vérification propriétaire interface source
+            # -----------------------------------------------------------------
+
+            if (
+                interface_source.equipement_id
+                != connexion.equipement_source_id
+            ):
+
+                raise ValueError(
+                    f"L'interface "
+                    f"{interface_source.id} "
+                    "n'appartient pas à "
+                    "l'équipement source."
+                )
+
+            # -----------------------------------------------------------------
+            # Vérification propriétaire interface destination
+            # -----------------------------------------------------------------
+
+            if (
+                interface_destination.equipement_id
+                != connexion.equipement_destination_id
+            ):
+
+                raise ValueError(
+                    f"L'interface "
+                    f"{interface_destination.id} "
+                    "n'appartient pas à "
+                    "l'équipement destination."
+                )
+
+            # -----------------------------------------------------------------
+            # Création du lien GNS3
+            # -----------------------------------------------------------------
+
+            link = gns3.create_link(
+                project_id=project_id,
+
+                node_source_id=source_node_id,
+                adapter_source=interface_source.adapter,
+                port_source=interface_source.port,
+
+                node_destination_id=destination_node_id,
+                adapter_destination=interface_destination.adapter,
+                port_destination=interface_destination.port,
             )
 
+            link_id = link.get(
+                "link_id"
+            )
 
-            links_created_response.append(
+            connexion.gns3_link_id = link_id
 
+            db.commit()
+
+            result["connexions"].append(
                 {
+                    "connexion_id": connexion.id,
+                    "gns3_link_id": link_id,
 
                     "source": {
-
-                        "node":
-                            source.node,
-
-                        "adapter":
-                            source.adapter,
-
-                        "port":
-                            source.port
-
+                        "equipement_id":
+                            connexion.equipement_source_id,
+                        "interface_id":
+                            connexion.interface_source_id,
                     },
 
                     "destination": {
-
-                        "node":
-                            destination.node,
-
-                        "adapter":
-                            destination.adapter,
-
-                        "port":
-                            destination.port
-
+                        "equipement_id":
+                            connexion.equipement_destination_id,
+                        "interface_id":
+                            connexion.interface_destination_id,
                     },
-
-                    "link_id":
-                        created_link.get(
-                            "link_id"
-                        )
-
                 }
-
             )
 
+        # =====================================================================
+        # ÉTAPE 10 - DÉMARRAGE AUTOMATIQUE DES ÉQUIPEMENTS
+        # =====================================================================
 
-        # ==================================================
-        # DEMARRAGE DES NODES
-        # ==================================================
+        for equipement in equipements:
 
-        nodes_started_response = []
-
-
-        for node in topology.nodes:
-
-
-            created_node = (
-                created_nodes[
-                    node.name
-                ]
+            node_id = node_map.get(
+                equipement.id
             )
 
-
-            node_id = (
-                created_node[
-                    "node_id"
-                ]
-            )
-
-
-            # ==============================================
-            # CLOUD
-            # ==============================================
-
-            if node.template == "cloud":
-
-                current_node = (
-
-                    gns3.get_node(
-
-                        project_id,
-
-                        node_id
-
-                    )
-
-                )
-
-
-                nodes_started_response.append(
-
-                    {
-
-                        "name":
-                            node.name,
-
-                        "node_id":
-                            node_id,
-
-                        "status":
-                            current_node.get(
-                                "status"
-                            ),
-
-                        "compute_id":
-                            current_node.get(
-                                "compute_id"
-                            ),
-
-                        "started":
-                            False,
-
-                        "message":
-                            "Cloud créé, aucun démarrage nécessaire"
-
-                    }
-
-                )
-
+            if not node_id:
                 continue
-
-
-            # ==============================================
-            # AUTRES NODES
-            # ==============================================
-
-            gns3.start_node(
-
-                project_id,
-
-                node_id
-
-            )
-
-
-            time.sleep(2)
-
-
-            current_node = (
-
-                gns3.get_node(
-
-                    project_id,
-
-                    node_id
-
-                )
-
-            )
-
-
-            nodes_started_response.append(
-
-                {
-
-                    "name":
-                        node.name,
-
-                    "node_id":
-                        node_id,
-
-                    "status":
-                        current_node.get(
-                            "status"
-                        ),
-
-                    "compute_id":
-                        current_node.get(
-                            "compute_id"
-                        ),
-
-                    "started":
-                        True
-
-                }
-
-            )
-
-
-        # ==================================================
-        # ATTENTE DU BOOT DES ROUTEURS
-        # ==================================================
-
-        time.sleep(15)
-
-
-        # ==================================================
-        # BOOTSTRAP AUTOMATIQUE PAR CONSOLE GNS3
-        # ==================================================
-
-        console_bootstrap_results = []
-
-
-        for node in topology.nodes:
-
-
-            if node.template != "router":
-
-                continue
-
-
-            bootstrap = (
-                node.console_bootstrap
-            )
-
-
-            if not bootstrap:
-
-                console_bootstrap_results.append(
-
-                    {
-
-                        "router":
-                            node.name,
-
-                        "bootstrapped":
-                            False,
-
-                        "error":
-                            "console_bootstrap absent"
-
-                    }
-
-                )
-
-                continue
-
-
-            console_netmiko = None
-
 
             try:
 
+                # -------------------------------------------------------------
+                # Démarrage
+                # -------------------------------------------------------------
 
-                # ==========================================
-                # NODE GNS3
-                # ==========================================
-
-                created_node = (
-
-                    created_nodes[
-                        node.name
-                    ]
-
+                gns3.start_node(
+                    project_id,
+                    node_id
                 )
 
+                # -------------------------------------------------------------
+                # Attente du démarrage
+                # -------------------------------------------------------------
 
-                node_id = (
-                    created_node[
-                        "node_id"
-                    ]
+                gns3.wait_for_node_started(
+                    project_id,
+                    node_id,
+                    timeout=120,
+                    interval=3,
                 )
 
+                equipement.actif = True
 
-                # ==========================================
-                # CONSOLE
-                # ==========================================
+                db.commit()
 
-                console = (
+            except Exception as error:
 
-                    gns3.get_node_console(
-
-                        project_id,
-
-                        node_id
-
-                    )
-
-                )
-
-
-                # ==========================================
-                # COMMANDES
-                # ==========================================
-
-                commands = (
-
-                    build_router_configuration(
-                        node
-                    )
-
-                )
-
-
-                # ==========================================
-                # CONNEXION TELNET
-                # ==========================================
-
-                console_netmiko = (
-
-                    NetmikoService(
-
-                        host=(
-                            console[
-                                "host"
-                            ]
-                        ),
-
-                        username=None,
-
-                        password=None,
-
-                        port=(
-                            console[
-                                "port"
-                            ]
-                        ),
-
-                        device_type=(
-                            "cisco_ios_telnet"
-                        )
-
-                    )
-
-                )
-
-
-                console_netmiko.connect_console(
-
-                    console_host=(
-                        console[
-                            "host"
-                        ]
-                    ),
-
-                    console_port=(
-                        console[
-                            "port"
-                        ]
-                    )
-
-                )
-
-
-                # ==========================================
-                # ENVOI CONFIGURATION
-                # ==========================================
-
-                output = (
-
-                    console_netmiko.bootstrap_configuration(
-                        commands
-                    )
-
-                )
-
-
-                # ==========================================
-                # SAUVEGARDE
-                # ==========================================
-
-                console_netmiko.save_config()
-
-
-                # ==========================================
-                # DECONNEXION
-                # ==========================================
-
-                console_netmiko.disconnect()
-
-
-                console_bootstrap_results.append(
-
+                result["erreurs"].append(
                     {
+                        "equipement":
+                            equipement.nom,
 
-                        "router":
-                            node.name,
+                        "etape":
+                            "demarrage",
 
-                        "console_host":
-                            console[
-                                "host"
-                            ],
-
-                        "console_port":
-                            console[
-                                "port"
-                            ],
-
-                        "bootstrapped":
-                            True,
-
-                        "commands_count":
-                            len(
-                                commands
-                            ),
-
-                        "output":
-                            output
-
+                        "erreur":
+                            str(error),
                     }
-
                 )
 
+        # =====================================================================
+        # ÉTAPE 11 - ATTENTE DES CONSOLES
+        # =====================================================================
 
-            except Exception as console_error:
+        time.sleep(3)
 
+        # =====================================================================
+        # ÉTAPE 12 - CONFIGURATION AUTOMATIQUE PAR CONSOLE
+        #
+        # C'est ici que nous configurons les interfaces AVANT SSH.
+        # =====================================================================
 
-                if console_netmiko:
+        for equipement in equipements:
 
-                    try:
-
-                        console_netmiko.disconnect()
-
-                    except Exception:
-
-                        pass
-
-
-                console_bootstrap_results.append(
-
-                    {
-
-                        "router":
-                            node.name,
-
-                        "bootstrapped":
-                            False,
-
-                        "error":
-                            str(
-                                console_error
-                            )
-
-                    }
-
-                )
-
-
-        # ==================================================
-        # ATTENTE ACTIVATION SSH
-        # ==================================================
-
-        time.sleep(5)
-
-
-        # ==================================================
-        # VERIFICATION SSH AVEC NETMIKO
-        # ==================================================
-
-        netmiko_results = []
-
-
-        for node in topology.nodes:
-
-
-            if node.template != "router":
-
-                continue
-
-
-            bootstrap = (
-                node.console_bootstrap
+            node_id = node_map.get(
+                equipement.id
             )
 
-
-            if not bootstrap:
-
+            if not node_id:
                 continue
 
+            try:
 
-            # ==============================================
-            # RECHERCHE IP MANAGEMENT
-            # ==============================================
+                # -------------------------------------------------------------
+                # Attente de la console GNS3
+                # -------------------------------------------------------------
 
-            management_ip = None
+                console = gns3.wait_for_console(
+                    project_id,
+                    node_id,
+                    timeout=120,
+                    interval=3,
+                )
 
+                console_host = (
+                    console.get("host")
+                    or "127.0.0.1"
+                )
 
-            for interface in node.interfaces:
+                console_port = console.get(
+                    "port"
+                )
 
+                if not console_port:
+
+                    raise ValueError(
+                        "Port console GNS3 introuvable."
+                    )
+
+                # -------------------------------------------------------------
+                # Connexion console Netmiko
+                # -------------------------------------------------------------
+
+                netmiko = NetmikoService(
+                    host=console_host,
+                    port=console_port,
+                )
+
+                netmiko.connect_console(
+                    console_host,
+                    console_port,
+                    max_attempts=10,
+                    delay=5,
+                )
+
+                # -------------------------------------------------------------
+                # Préparation de la console
+                # -------------------------------------------------------------
+
+                netmiko.prepare_console()
+
+                # -------------------------------------------------------------
+                # Récupération des interfaces MySQL
+                # -------------------------------------------------------------
+
+                interfaces = (
+                    db.query(Interface)
+                    .filter(
+                        Interface.equipement_id
+                        == equipement.id
+                    )
+                    .all()
+                )
+
+                # -------------------------------------------------------------
+                # Construction automatique des commandes interfaces
+                # -------------------------------------------------------------
+
+                interface_commands = (
+                    build_interface_commands(
+                        interfaces
+                    )
+                )
+
+                # -------------------------------------------------------------
+                # Configuration interfaces
+                # -------------------------------------------------------------
+
+                if interface_commands:
+
+                    netmiko.send_config(
+                        interface_commands
+                    )
+
+                # -------------------------------------------------------------
+                # Configuration SSH
+                # -------------------------------------------------------------
+
+                ssh_commands = (
+                    build_ssh_commands(
+                        equipement
+                    )
+                )
+
+                if ssh_commands:
+
+                    netmiko.send_config(
+                        ssh_commands
+                    )
+
+                # -------------------------------------------------------------
+                # Génération automatique des clés RSA
+                # -------------------------------------------------------------
 
                 if (
-
-                    interface.ip
-
-                    and
-
-                    interface.ip.startswith(
-                        "192.168.100."
-                    )
-
+                    equipement.username
+                    and equipement.password
                 ):
 
-                    management_ip = (
-                        interface.ip
+                    netmiko.generate_rsa_keys(
+                        modulus=1024
                     )
 
-                    break
+                # -------------------------------------------------------------
+                # Sauvegarde
+                # -------------------------------------------------------------
 
+                netmiko.save_config()
 
-            if not management_ip:
+                # -------------------------------------------------------------
+                # Vérification console
+                # -------------------------------------------------------------
 
-                netmiko_results.append(
+                interface_output = (
+                    netmiko.send_command(
+                        "show ip interface brief"
+                    )
+                )
 
+                # -------------------------------------------------------------
+                # Déconnexion console
+                # -------------------------------------------------------------
+
+                netmiko.disconnect()
+
+                # -------------------------------------------------------------
+                # Résultat
+                # -------------------------------------------------------------
+
+                result[
+                    "configuration_interfaces"
+                ].append(
                     {
+                        "equipement":
+                            equipement.nom,
 
-                        "router":
-                            node.name,
+                        "status":
+                            "success",
 
-                        "configured":
-                            False,
+                        "interfaces_configurees":
+                            len(interface_commands),
 
-                        "error":
-                            "Adresse IP management introuvable"
-
+                        "verification":
+                            interface_output,
                     }
+                )
 
+                result[
+                    "configuration_ssh"
+                ].append(
+                    {
+                        "equipement":
+                            equipement.nom,
+
+                        "status":
+                            "configured",
+                    }
+                )
+
+            except Exception as error:
+
+                result["erreurs"].append(
+                    {
+                        "equipement":
+                            equipement.nom,
+
+                        "etape":
+                            "configuration_console",
+
+                        "erreur":
+                            str(error),
+                    }
+                )
+
+        # =====================================================================
+        # ÉTAPE 13 - ATTENTE DU DÉMARRAGE DU SERVICE SSH
+        # =====================================================================
+
+        time.sleep(10)
+
+        # =====================================================================
+        # ÉTAPE 14 - CONNEXION SSH AUTOMATIQUE AVEC NETMIKO
+        # =====================================================================
+
+        for equipement in equipements:
+
+            # -----------------------------------------------------------------
+            # Il faut une IP de management
+            # -----------------------------------------------------------------
+
+            if not equipement.management_ip:
+
+                result["erreurs"].append(
+                    {
+                        "equipement":
+                            equipement.nom,
+
+                        "etape":
+                            "ssh",
+
+                        "erreur":
+                            "Aucune management_ip définie.",
+                    }
                 )
 
                 continue
 
+            # -----------------------------------------------------------------
+            # Identifiants SSH
+            # -----------------------------------------------------------------
 
-            ssh_netmiko = None
+            if not equipement.username:
 
+                result["erreurs"].append(
+                    {
+                        "equipement":
+                            equipement.nom,
+
+                        "etape":
+                            "ssh",
+
+                        "erreur":
+                            "Aucun username SSH défini.",
+                    }
+                )
+
+                continue
+
+            if not equipement.password:
+
+                result["erreurs"].append(
+                    {
+                        "equipement":
+                            equipement.nom,
+
+                        "etape":
+                            "ssh",
+
+                        "erreur":
+                            "Aucun password SSH défini.",
+                    }
+                )
+
+                continue
 
             try:
 
+                # -------------------------------------------------------------
+                # Création Netmiko SSH
+                # -------------------------------------------------------------
 
-                # ==========================================
-                # CONNEXION SSH
-                # ==========================================
+                netmiko = NetmikoService(
+                    host=equipement.management_ip,
 
-                ssh_netmiko = (
+                    username=equipement.username,
 
-                    NetmikoService(
+                    password=equipement.password,
 
-                        host=management_ip,
+                    secret=equipement.enable_secret,
 
-                        username=(
-                            bootstrap.username
-                        ),
+                    device_type="cisco_ios",
 
-                        password=(
-                            bootstrap.password
-                        ),
-
-                        secret=(
-                            bootstrap.enable_secret
-                        )
-
-                    )
-
+                    port=22,
                 )
 
+                # -------------------------------------------------------------
+                # Connexion SSH
+                # -------------------------------------------------------------
 
-                ssh_netmiko.connect()
-
-
-                # ==========================================
-                # VERIFICATION
-                # ==========================================
-
-                verification = (
-
-                    ssh_netmiko.send_commands(
-
-                        [
-
-                            "show ip interface brief",
-
-                            "show ip ssh",
-
-                            "show running-config"
-
-                        ]
-
-                    )
-
+                netmiko.connect(
+                    max_attempts=10,
+                    delay=10,
                 )
 
+                # -------------------------------------------------------------
+                # Vérification SSH
+                # -------------------------------------------------------------
 
-                ssh_netmiko.disconnect()
+                hostname = netmiko.send_command(
+                    "show running-config | include hostname"
+                )
 
+                interfaces = netmiko.send_command(
+                    "show ip interface brief"
+                )
 
-                netmiko_results.append(
+                # -------------------------------------------------------------
+                # Sauvegarde
+                # -------------------------------------------------------------
 
+                netmiko.save_config()
+
+                # -------------------------------------------------------------
+                # Déconnexion
+                # -------------------------------------------------------------
+
+                netmiko.disconnect()
+
+                # -------------------------------------------------------------
+                # Résultat SSH
+                # -------------------------------------------------------------
+
+                result[
+                    "verification_ssh"
+                ].append(
                     {
-
-                        "router":
-                            node.name,
+                        "equipement":
+                            equipement.nom,
 
                         "management_ip":
-                            management_ip,
+                            equipement.management_ip,
 
-                        "configured":
-                            True,
+                        "status":
+                            "success",
 
-                        "verification":
-                            verification
+                        "hostname":
+                            hostname,
 
+                        "interfaces":
+                            interfaces,
                     }
-
                 )
 
+            except Exception as error:
 
-            except Exception as netmiko_error:
-
-
-                if ssh_netmiko:
-
-                    try:
-
-                        ssh_netmiko.disconnect()
-
-                    except Exception:
-
-                        pass
-
-
-                netmiko_results.append(
-
+                result["erreurs"].append(
                     {
+                        "equipement":
+                            equipement.nom,
 
-                        "router":
-                            node.name,
+                        "etape":
+                            "ssh",
 
                         "management_ip":
-                            management_ip,
+                            equipement.management_ip,
 
-                        "configured":
-                            False,
-
-                        "error":
-                            str(
-                                netmiko_error
-                            )
-
+                        "erreur":
+                            str(error),
                     }
-
                 )
 
+        # =====================================================================
+        # ÉTAPE 15 - STATUT FINAL
+        # =====================================================================
 
-        # ==================================================
-        # REPONSE FINALE
-        # ==================================================
+        if result["erreurs"]:
 
-        return {
+            topologie.statut = (
+                "deployed_with_errors"
+            )
 
-            "message":
+        else:
 
-                "Topologie déployée avec succès",
+            topologie.statut = (
+                "deployed"
+            )
 
+        db.commit()
 
-            "gns3_version":
+        result[
+            "topologie"
+        ]["statut"] = topologie.statut
 
-                version,
+        return result
 
+    # =========================================================================
+    # ÉTAPE 16 - GESTION DES ERREURS
+    # =========================================================================
 
-            "computes":
+    except HTTPException:
 
-                computes,
+        topologie.statut = "error"
 
+        db.commit()
 
-            "project": {
-
-                "name":
-
-                    project.get(
-                        "name"
-                    ),
-
-                "project_id":
-
-                    project_id
-
-            },
-
-
-            "nombre_nodes":
-
-                len(
-                    created_nodes
-                ),
-
-
-            "nombre_links":
-
-                len(
-                    links_created_response
-                ),
-
-
-            "nodes_created":
-
-                nodes_created_response,
-
-
-            "links_created":
-
-                links_created_response,
-
-
-            "nodes_started":
-
-                nodes_started_response,
-
-
-            # ==========================================
-            # RESULTAT BOOTSTRAP CONSOLE
-            # ==========================================
-
-            "console_bootstrap":
-
-                console_bootstrap_results,
-
-
-            # ==========================================
-            # RESULTAT VERIFICATION SSH
-            # ==========================================
-
-            "netmiko_configuration":
-
-                netmiko_results
-
-        }
-
+        raise
 
     except Exception as error:
 
+        topologie.statut = "error"
+
+        db.commit()
 
         raise HTTPException(
-
             status_code=500,
-
             detail=(
-
-                "Erreur lors du "
-                "déploiement GNS3 : "
+                "Erreur pendant le déploiement : "
                 f"{str(error)}"
-
-            )
-
+            ),
         )

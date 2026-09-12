@@ -22,7 +22,7 @@ load_dotenv()
 
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
-    "mysql+pymysql://root:@localhost:3306/gestion_reseau"
+    "mysql+pymysql://root:@localhost:3306/automatisation_reseau"
 )
 
 
