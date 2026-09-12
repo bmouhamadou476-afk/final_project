@@ -126,7 +126,97 @@ def build_ssh_commands(equipement):
 # ÉTAPE 5 - DEPLOIEMENT COMPLET
 # =============================================================================
 
-@router.post("/{topologie_id}/deploy")
+@router.post(
+    "/{topologie_id}/deploy",
+
+    summary="Déployer automatiquement une topologie",
+
+    description="""
+    # Déploiement automatique d'une topologie réseau
+
+    Déploie une topologie enregistrée dans MySQL vers GNS3.
+
+    ## Étapes du déploiement
+
+    Le processus automatique réalise les opérations suivantes :
+
+    1. Récupération de la topologie depuis MySQL.
+    2. Création ou récupération du projet GNS3.
+    3. Création des équipements dans GNS3.
+    4. Création des connexions entre les équipements.
+    5. Démarrage automatique des équipements.
+    6. Attente de la disponibilité des consoles.
+    7. Connexion automatique aux consoles GNS3.
+    8. Configuration des interfaces réseau.
+    9. Configuration des utilisateurs SSH.
+    10. Configuration des lignes VTY.
+    11. Génération des clés RSA.
+    12. Sauvegarde de la configuration.
+    13. Attente de la disponibilité du service SSH.
+    14. Connexion automatique avec Netmiko.
+    15. Vérification des interfaces et de la configuration.
+
+    ## Source des données
+
+    MySQL constitue la source de vérité.
+
+    Les équipements sont récupérés depuis la table `equipements`,
+    les interfaces depuis `interfaces` et les connexions depuis
+    `connexions`.
+
+    ## GNS3
+
+    Les équipements sont automatiquement créés dans le projet GNS3
+    correspondant à la topologie.
+
+    ## SSH / Netmiko
+
+    Une fois l'adresse IP de management configurée par la console,
+    l'application établit automatiquement une connexion SSH avec
+    Netmiko.
+
+    ## Résultat
+
+    Le endpoint retourne :
+
+    - les informations du projet GNS3 ;
+    - les équipements créés ;
+    - les connexions créées ;
+    - la configuration des interfaces ;
+    - la configuration SSH ;
+    - les vérifications SSH ;
+    - les éventuelles erreurs.
+    """,
+
+    response_description=(
+        "Résultat détaillé du déploiement "
+        "de la topologie"
+    ),
+
+    responses={
+        200: {
+            "description": (
+                "Topologie déployée avec succès "
+                "ou avec des erreurs partielles."
+            )
+        },
+        400: {
+            "description": (
+                "La topologie ne peut pas être déployée."
+            )
+        },
+        404: {
+            "description": (
+                "Topologie introuvable."
+            )
+        },
+        500: {
+            "description": (
+                "Erreur interne pendant le déploiement."
+            )
+        },
+    },
+)
 def deploy_topologie(
     topologie_id: int,
     db: Session = Depends(get_db),

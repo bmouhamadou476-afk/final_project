@@ -1,4 +1,14 @@
-from fastapi import APIRouter, Depends, HTTPException
+# =============================================================================
+# ROUTES ÉQUIPEMENTS
+# =============================================================================
+
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    status,
+)
+
 from sqlalchemy.orm import Session
 
 from app.databases import get_db
@@ -13,80 +23,82 @@ from app.schemas.equipement import (
 )
 
 
+# =============================================================================
+# ROUTER
+# =============================================================================
+
 router = APIRouter(
     prefix="/api/equipements",
     tags=["Équipements"],
 )
 
 
-# ============================================================
-# GET - Tous les équipements
-# ============================================================
+# =============================================================================
+# GET - LISTE
+# =============================================================================
 
 @router.get(
     "",
-    response_model=list[EquipementResponse]
+    response_model=list[EquipementResponse],
+    summary="Lister les équipements",
+    description="""
+    Retourne tous les équipements enregistrés.
+
+    Les équipements peuvent être associés à une topologie
+    et à un projet GNS3.
+    """,
+    response_description="Liste des équipements",
 )
 def get_equipements(
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
 
-    return db.query(Equipement).all()
+    return db.query(
+        Equipement
+    ).all()
 
 
-# ============================================================
-# GET - Équipement par ID
-# ============================================================
-
-@router.get(
-    "/{equipement_id}",
-    response_model=EquipementResponse
-)
-def get_equipement(
-    equipement_id: int,
-    db: Session = Depends(get_db)
-):
-
-    equipement = (
-        db.query(Equipement)
-        .filter(Equipement.id == equipement_id)
-        .first()
-    )
-
-    if not equipement:
-        raise HTTPException(
-            status_code=404,
-            detail="Équipement introuvable"
-        )
-
-    return equipement
-
-
-# ============================================================
-# POST - Créer un équipement
-# ============================================================
+# =============================================================================
+# POST - CRÉATION
+# =============================================================================
 
 @router.post(
     "",
     response_model=EquipementResponse,
-    status_code=201
+    status_code=status.HTTP_201_CREATED,
+    summary="Créer un équipement",
+    description="""
+    Crée un équipement réseau dans une topologie.
+
+    Les informations GNS3 peuvent être renseignées dès la création :
+
+    - template GNS3 ;
+    - compute ;
+    - position X/Y.
+
+    Les paramètres de management permettent ensuite
+    l'automatisation SSH avec Netmiko.
+    """,
+    response_description="Équipement créé",
 )
 def create_equipement(
     data: EquipementCreate,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
 
-    # Vérifier que la topologie existe
     topologie = (
         db.query(Topologie)
-        .filter(Topologie.id == data.topologie_id)
+        .filter(
+            Topologie.id == data.topologie_id
+        )
         .first()
     )
 
     if not topologie:
+
         raise HTTPException(
-            status_code=404,
-            detail="Topologie introuvable"
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Topologie introuvable.",
         )
 
     equipement = Equipement(
@@ -102,87 +114,150 @@ def create_equipement(
         x=data.x,
         y=data.y,
         topologie_id=data.topologie_id,
-        actif=False
+        actif=False,
     )
 
     db.add(equipement)
+
     db.commit()
+
     db.refresh(equipement)
 
     return equipement
 
 
-# ============================================================
-# PUT - Modifier un équipement
-# ============================================================
+# =============================================================================
+# GET - UN ÉQUIPEMENT
+# =============================================================================
+
+@router.get(
+    "/{equipement_id}",
+    response_model=EquipementResponse,
+    summary="Récupérer un équipement",
+    description="""
+    Retourne les informations d'un équipement à partir de son identifiant.
+    """,
+    response_description="Équipement demandé",
+)
+def get_equipement(
+    equipement_id: int,
+    db: Session = Depends(get_db),
+):
+
+    equipement = (
+        db.query(Equipement)
+        .filter(
+            Equipement.id == equipement_id
+        )
+        .first()
+    )
+
+    if not equipement:
+
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Équipement introuvable.",
+        )
+
+    return equipement
+
+
+# =============================================================================
+# PUT - MODIFICATION
+# =============================================================================
 
 @router.put(
     "/{equipement_id}",
-    response_model=EquipementResponse
+    response_model=EquipementResponse,
+    summary="Modifier un équipement",
+    description="""
+    Modifie la configuration d'un équipement existant.
+
+    Les paramètres de management et les informations GNS3
+    peuvent également être modifiés.
+    """,
+    response_description="Équipement modifié",
 )
 def update_equipement(
     equipement_id: int,
     data: EquipementUpdate,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
 
     equipement = (
         db.query(Equipement)
-        .filter(Equipement.id == equipement_id)
+        .filter(
+            Equipement.id == equipement_id
+        )
         .first()
     )
 
     if not equipement:
+
         raise HTTPException(
-            status_code=404,
-            detail="Équipement introuvable"
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Équipement introuvable.",
         )
 
-    update_data = data.model_dump(
+    values = data.model_dump(
         exclude_unset=True
     )
 
-    for key, value in update_data.items():
+    for field, value in values.items():
+
         setattr(
             equipement,
-            key,
-            value
+            field,
+            value,
         )
 
     db.commit()
+
     db.refresh(equipement)
 
     return equipement
 
 
-# ============================================================
-# DELETE - Supprimer un équipement
-# ============================================================
+# =============================================================================
+# DELETE - SUPPRESSION
+# =============================================================================
 
 @router.delete(
-    "/{equipement_id}"
+    "/{equipement_id}",
+    summary="Supprimer un équipement",
+    description="""
+    Supprime un équipement de la base de données.
+
+    Les interfaces associées sont également supprimées
+    selon la relation définie dans le modèle SQLAlchemy.
+    """,
+    response_description="Confirmation de suppression",
 )
 def delete_equipement(
     equipement_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
 
     equipement = (
         db.query(Equipement)
-        .filter(Equipement.id == equipement_id)
+        .filter(
+            Equipement.id == equipement_id
+        )
         .first()
     )
 
     if not equipement:
+
         raise HTTPException(
-            status_code=404,
-            detail="Équipement introuvable"
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Équipement introuvable.",
         )
 
     db.delete(equipement)
+
     db.commit()
 
     return {
-        "message": "Équipement supprimé avec succès",
-        "id": equipement_id
+        "message": "Équipement supprimé avec succès.",
+        "equipement_id": equipement_id,
     }

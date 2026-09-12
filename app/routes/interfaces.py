@@ -1,4 +1,14 @@
-from fastapi import APIRouter, Depends, HTTPException
+# =============================================================================
+# ROUTES INTERFACES
+# =============================================================================
+
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    status,
+)
+
 from sqlalchemy.orm import Session
 
 from app.databases import get_db
@@ -13,67 +23,71 @@ from app.schemas.interface import (
 )
 
 
+# =============================================================================
+# ROUTER
+# =============================================================================
+
 router = APIRouter(
     prefix="/api/interfaces",
     tags=["Interfaces"],
 )
 
 
-# ============================================================
-# GET - Toutes les interfaces
-# ============================================================
+# =============================================================================
+# GET - LISTE
+# =============================================================================
 
 @router.get(
     "",
-    response_model=list[InterfaceResponse]
+    response_model=list[InterfaceResponse],
+    summary="Lister les interfaces",
+    description="""
+    Retourne toutes les interfaces enregistrées dans la base de données.
+
+    Chaque interface contient notamment :
+
+    - son nom ;
+    - son adresse IP ;
+    - son masque ;
+    - sa description ;
+    - son numéro d'adaptateur GNS3 ;
+    - son numéro de port GNS3 ;
+    - son équipement parent.
+    """,
+    response_description="Liste des interfaces",
 )
 def get_interfaces(
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
 
-    return db.query(Interface).all()
+    return db.query(
+        Interface
+    ).all()
 
 
-# ============================================================
-# GET - Interface par ID
-# ============================================================
-
-@router.get(
-    "/{interface_id}",
-    response_model=InterfaceResponse
-)
-def get_interface(
-    interface_id: int,
-    db: Session = Depends(get_db)
-):
-
-    interface = (
-        db.query(Interface)
-        .filter(Interface.id == interface_id)
-        .first()
-    )
-
-    if not interface:
-        raise HTTPException(
-            status_code=404,
-            detail="Interface introuvable"
-        )
-
-    return interface
-
-
-# ============================================================
-# POST - Créer une interface
-# ============================================================
+# =============================================================================
+# POST - CRÉATION
+# =============================================================================
 
 @router.post(
     "",
     response_model=InterfaceResponse,
-    status_code=201
+    status_code=status.HTTP_201_CREATED,
+    summary="Créer une interface",
+    description="""
+    Crée une interface réseau et l'associe à un équipement.
+
+    L'adresse IP et le masque seront utilisés automatiquement
+    lors du déploiement pour configurer l'interface sur le routeur.
+
+    Les valeurs `adapter` et `port` correspondent aux interfaces
+    utilisées par GNS3 pour créer les connexions.
+    """,
+    response_description="Interface créée",
 )
 def create_interface(
     data: InterfaceCreate,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
 
     equipement = (
@@ -85,9 +99,10 @@ def create_interface(
     )
 
     if not equipement:
+
         raise HTTPException(
-            status_code=404,
-            detail="Équipement introuvable"
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Équipement introuvable.",
         )
 
     interface = Interface(
@@ -97,87 +112,147 @@ def create_interface(
         description=data.description,
         adapter=data.adapter,
         port=data.port,
-        equipement_id=data.equipement_id
+        equipement_id=data.equipement_id,
     )
 
     db.add(interface)
+
     db.commit()
+
     db.refresh(interface)
 
     return interface
 
 
-# ============================================================
-# PUT - Modifier une interface
-# ============================================================
+# =============================================================================
+# GET - UNE INTERFACE
+# =============================================================================
+
+@router.get(
+    "/{interface_id}",
+    response_model=InterfaceResponse,
+    summary="Récupérer une interface",
+    description="""
+    Retourne les informations d'une interface à partir de son identifiant.
+    """,
+    response_description="Interface demandée",
+)
+def get_interface(
+    interface_id: int,
+    db: Session = Depends(get_db),
+):
+
+    interface = (
+        db.query(Interface)
+        .filter(
+            Interface.id == interface_id
+        )
+        .first()
+    )
+
+    if not interface:
+
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Interface introuvable.",
+        )
+
+    return interface
+
+
+# =============================================================================
+# PUT - MODIFICATION
+# =============================================================================
 
 @router.put(
     "/{interface_id}",
-    response_model=InterfaceResponse
+    response_model=InterfaceResponse,
+    summary="Modifier une interface",
+    description="""
+    Modifie la configuration d'une interface existante.
+
+    Les modifications seront prises en compte lors du prochain
+    déploiement de la topologie.
+    """,
+    response_description="Interface modifiée",
 )
 def update_interface(
     interface_id: int,
     data: InterfaceUpdate,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
 
     interface = (
         db.query(Interface)
-        .filter(Interface.id == interface_id)
+        .filter(
+            Interface.id == interface_id
+        )
         .first()
     )
 
     if not interface:
+
         raise HTTPException(
-            status_code=404,
-            detail="Interface introuvable"
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Interface introuvable.",
         )
 
-    update_data = data.model_dump(
+    values = data.model_dump(
         exclude_unset=True
     )
 
-    for key, value in update_data.items():
+    for field, value in values.items():
+
         setattr(
             interface,
-            key,
-            value
+            field,
+            value,
         )
 
     db.commit()
+
     db.refresh(interface)
 
     return interface
 
 
-# ============================================================
-# DELETE - Supprimer une interface
-# ============================================================
+# =============================================================================
+# DELETE - SUPPRESSION
+# =============================================================================
 
 @router.delete(
-    "/{interface_id}"
+    "/{interface_id}",
+    summary="Supprimer une interface",
+    description="""
+    Supprime une interface de la base de données.
+    """,
+    response_description="Confirmation de suppression",
 )
 def delete_interface(
     interface_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
 
     interface = (
         db.query(Interface)
-        .filter(Interface.id == interface_id)
+        .filter(
+            Interface.id == interface_id
+        )
         .first()
     )
 
     if not interface:
+
         raise HTTPException(
-            status_code=404,
-            detail="Interface introuvable"
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Interface introuvable.",
         )
 
     db.delete(interface)
+
     db.commit()
 
     return {
-        "message": "Interface supprimée avec succès",
-        "id": interface_id
+        "message": "Interface supprimée avec succès.",
+        "interface_id": interface_id,
     }
